@@ -1,0 +1,139 @@
+package io.github.christechs.routerec;
+
+import io.github.christechs.routerec.commands.*;
+import io.github.christechs.routerec.items.*;
+import io.github.christechs.routerec.manager.RecorderManager;
+import io.github.christechs.routerec.manager.RoomManager;
+import io.github.christechs.routerec.manager.RouteManager;
+import io.github.christechs.routerec.manager.SecretManager;
+import io.github.christechs.routerec.render.RenderUtils;
+import net.kyori.adventure.key.Key;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.minestom.server.MinecraftServer;
+import net.minestom.server.coordinate.Pos;
+import net.minestom.server.entity.Player;
+import net.minestom.server.event.EventFilter;
+import net.minestom.server.event.EventNode;
+import net.minestom.server.event.GlobalEventHandler;
+import net.minestom.server.event.player.AsyncPlayerConfigurationEvent;
+import net.minestom.server.event.player.PlayerDisconnectEvent;
+import net.minestom.server.event.player.PlayerPluginMessageEvent;
+import net.minestom.server.event.player.PlayerSpawnEvent;
+import net.minestom.server.event.player.PlayerTickEvent;
+import net.minestom.server.event.trait.PlayerEvent;
+import net.minestom.server.instance.InstanceContainer;
+import net.minestom.server.instance.block.Block;
+import net.minestom.server.registry.RegistryKey;
+import net.minestom.server.world.DimensionType;
+
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class RouteRecorderServer {
+
+    private static final List<CustomItem> CUSTOM_ITEMS = List.of(
+            new AOTV(), new Stonk(), new Superboom(), new Pearl(), new WorldModifier(), new Plank(),
+            new StepBackward(), new StepForward(), new BonzoStaff()
+    );
+
+    public static RegistryKey<DimensionType> DIM_1;
+    public static RegistryKey<DimensionType> DIM_2;
+    public static InstanceContainer lobby;
+
+    private static final Map<UUID, Long> LAVA_COOLDOWNS = new ConcurrentHashMap<>();
+
+    public static void main(String[] args) {
+        MinecraftServer server = MinecraftServer.init();
+
+        DimensionType dim1 = DimensionType.builder().ambientLight(2.0f).fixedTime(true).build();
+        DimensionType dim2 = DimensionType.builder().ambientLight(1.99f).fixedTime(true).build();
+
+        DIM_1 = MinecraftServer.getDimensionTypeRegistry().register(Key.key("dim_1"), dim1);
+        DIM_2 = MinecraftServer.getDimensionTypeRegistry().register(Key.key("dim_2"), dim2);
+
+        RouteManager.init("routes/pearlroutes.json");
+        SecretManager.init("routes/secretlocations.json");
+        RoomManager.init();
+
+        lobby = MinecraftServer.getInstanceManager().createInstanceContainer(DIM_1);
+        lobby.setGenerator(unit -> unit.modifier().fillHeight(0, 40, Block.DIRT));
+
+        GlobalEventHandler globalEventHandler = MinecraftServer.getGlobalEventHandler();
+        globalEventHandler.addListener(AsyncPlayerConfigurationEvent.class, event -> {
+            event.setSpawningInstance(lobby);
+            event.getPlayer().setRespawnPoint(new Pos(0, 42, 0));
+        });
+
+        globalEventHandler.addListener(PlayerPluginMessageEvent.class, event -> {
+            if (event.getIdentifier().equals("debug:hello")) {
+                RenderUtils.markHasMod(event.getPlayer());
+                event.getPlayer().sendMessage(Component.text("Native Debug Shapes Enabled!", NamedTextColor.GREEN));
+            }
+        });
+
+        globalEventHandler.addListener(PlayerDisconnectEvent.class, event -> {
+            RenderUtils.clearAll(event.getPlayer());
+            Superboom.clearMemory();
+            WorldModifier.clearMemory();
+            LAVA_COOLDOWNS.remove(event.getPlayer().getUuid());
+        });
+
+        globalEventHandler.addListener(PlayerSpawnEvent.class, event -> {
+            Player player = event.getPlayer();
+            player.setAllowFlying(true);
+            player.getInventory().clear();
+            CUSTOM_ITEMS.forEach(item -> player.getInventory().addItemStack(item.getItem()));
+        });
+
+        globalEventHandler.addListener(PlayerTickEvent.class, event -> {
+            Player player = event.getPlayer();
+            if (player.getInstance() != null) {
+                Block block = player.getInstance().getBlock(player.getPosition());
+                Block feetBlock = player.getInstance().getBlock(player.getPosition().sub(0, 0.2, 0));
+
+                if (block.name().toLowerCase().contains("lava") || feetBlock.name().toLowerCase().contains("lava")) {
+                    long now = System.currentTimeMillis();
+                    if (now - LAVA_COOLDOWNS.getOrDefault(player.getUuid(), 0L) > 500) {
+                        LAVA_COOLDOWNS.put(player.getUuid(), now);
+                        float pitch = player.getPosition().pitch();
+                        boolean isSuper = pitch <= -40f;
+                        double jumpVelocityY = 35.0;
+                        if (isSuper) jumpVelocityY *= 1.3;
+                        double surfaceY = Math.floor(player.getPosition().y()) + 0.95;
+                        if (player.getPosition().y() < surfaceY) player.teleport(player.getPosition().withY(surfaceY));
+                        player.setVelocity(player.getVelocity().withY(jumpVelocityY));
+                    }
+                }
+            }
+        });
+
+        EventNode<PlayerEvent> itemNode = EventNode.type("custom-items", EventFilter.PLAYER);
+        CUSTOM_ITEMS.forEach(item -> item.registerEvents(itemNode));
+        globalEventHandler.addChild(itemNode);
+
+        EventNode<PlayerEvent> secretsNode = EventNode.type("secrets", EventFilter.PLAYER);
+        SecretManager.registerEvents(secretsNode);
+        globalEventHandler.addChild(secretsNode);
+
+        MinecraftServer.getCommandManager().register(new SpeedCommand());
+        MinecraftServer.getCommandManager().register(new LoadCommand());
+        MinecraftServer.getCommandManager().register(new GamemodeCommand());
+        MinecraftServer.getCommandManager().register(new RecordingCommand());
+        MinecraftServer.getCommandManager().register(new LoadRecordingRoutes());
+        MinecraftServer.getCommandManager().register(new FixerCommand());
+        MinecraftServer.getCommandManager().register(new RoutesCommand());
+
+        MinecraftServer.getSchedulerManager().buildTask(() -> {
+            for (Player p : MinecraftServer.getConnectionManager().getOnlinePlayers()) {
+                if (RecorderManager.isRecording && !RecorderManager.isPaused) {
+                    RecorderManager.recordLocation(p.getPosition().asVec());
+                }
+            }
+        }).repeat(net.minestom.server.timer.TaskSchedule.tick(10)).schedule();
+
+        server.start("0.0.0.0", 25565);
+    }
+}
